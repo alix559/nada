@@ -1,0 +1,3 @@
+# Unfused LAION CLAP checkpoint used by nada.download.
+# laion/clap-htsat-unfused is the Hugging Face release of 630k-audioset-best.pt.
+laion/clap-htsat-unfused

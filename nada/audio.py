@@ -1,0 +1,463 @@
+"""HTSAT audio tower, as the unfused `ClapAudioModel` runs it.
+
+The log-mel is normalized with a frozen BatchNorm over the mel bins, stretched
+in time with PyTorch's align-corners bicubic filter, and folded into a square
+image. A Swin transformer reads that image in windows. The embedding is the
+mean of the last stage's tokens. Feature fusion (the four-crop path) is not
+part of this tower; the unfused checkpoint does not use it.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from max.dtype import DType
+from max.experimental import functional as F
+from max.experimental.nn import Conv2d, LayerNorm, Linear, Module, ModuleList
+from max.experimental.tensor import Tensor
+
+from .config import AudioConfig
+
+# nn.LayerNorm() with no epsilon argument. The Swin blocks use the config value.
+_DEFAULT_NORM_EPS = 1e-5
+
+
+def bicubic_map(in_size: int, out_size: int) -> np.ndarray:
+    """`(out_size, in_size)` weights for bicubic resize with align_corners.
+
+    PyTorch's `interpolate(..., mode="bicubic", align_corners=True)` uses the
+    Keys cubic with `a = -0.75` and clamps samples to the input. MAX's
+    `resize_bicubic` is the half-pixel variant, so the stretch is a matmul
+    with this matrix instead.
+    """
+    if in_size == out_size:
+        return np.eye(in_size, dtype=np.float32)
+    scale = 0.0 if out_size <= 1 else (in_size - 1) / (out_size - 1)
+    src = np.arange(out_size, dtype=np.float64) * scale
+    src_idx = np.floor(src).astype(np.int64)
+    frac = src - src_idx
+    weights = np.stack(
+        [
+            _cubic(frac + 1),
+            _cubic(frac),
+            _cubic(1 - frac),
+            _cubic(2 - frac),
+        ],
+        axis=1,
+    )
+    indices = np.clip(src_idx[:, None] + np.array([-1, 0, 1, 2]), 0, in_size - 1)
+    matrix = np.zeros((out_size, in_size), dtype=np.float64)
+    rows = np.arange(out_size)
+    for tap in range(4):
+        np.add.at(matrix, (rows, indices[:, tap]), weights[:, tap])
+    return matrix.astype(np.float32)
+
+
+def _cubic(distance: np.ndarray, a: float = -0.75) -> np.ndarray:
+    x = np.abs(distance)
+    near = ((a + 2) * x - (a + 3)) * x * x + 1
+    far = ((a * x - 5 * a) * x + 8 * a) * x - 4 * a
+    return np.where(x <= 1, near, np.where(x < 2, far, 0.0))
+
+
+def relative_position_index(window: int) -> np.ndarray:
+    """Pairwise relative-position index inside one Swin window. Shape `(area, area)`."""
+    coords = np.stack(np.meshgrid(np.arange(window), np.arange(window), indexing="ij"))
+    flat = coords.reshape(2, -1)
+    relative = (flat[:, :, None] - flat[:, None, :]).transpose(1, 2, 0)
+    relative[:, :, 0] += window - 1
+    relative[:, :, 1] += window - 1
+    relative[:, :, 0] *= 2 * window - 1
+    return relative.sum(-1).astype(np.int64)
+
+
+def shifted_window_mask(height: int, width: int, window: int, shift: int) -> np.ndarray | None:
+    """Attention mask for a cyclic shift. Zeros attend; `-100` does not."""
+    if shift <= 0:
+        return None
+    h_index = np.arange(height)
+    w_index = np.arange(width)
+    h_region = (h_index >= height - window).astype(np.int64) + (h_index >= height - shift).astype(np.int64)
+    w_region = (w_index >= width - window).astype(np.int64) + (w_index >= width - shift).astype(np.int64)
+    image = h_region[None, :, None] * 3 + w_region[None, None, :]
+    windows_h = height // window
+    windows_w = width // window
+    image = image.reshape(1, windows_h, window, windows_w, window)
+    image = image.transpose(0, 1, 3, 2, 4).reshape(-1, window * window)
+    difference = image[:, None, :] - image[:, :, None]
+    return np.where(difference != 0, np.float32(-100.0), np.float32(0.0))
+
+
+def _roll(x: Tensor, shift: int, axis: int, size: int, *, invert: bool) -> Tensor:
+    """`torch.roll` by `-shift` along `axis`, or the opposite roll when `invert`."""
+    spec = [slice(None)] * 4
+    if not invert:
+        spec[axis] = slice(shift, None)
+        head = F.slice_tensor(x, spec)
+        spec[axis] = slice(None, shift)
+        tail = F.slice_tensor(x, spec)
+        return F.concat([head, tail], axis=axis)
+    spec[axis] = slice(size - shift, None)
+    tail = F.slice_tensor(x, spec)
+    spec[axis] = slice(None, size - shift)
+    head = F.slice_tensor(x, spec)
+    return F.concat([tail, head], axis=axis)
+
+
+def roll_hw(x: Tensor, shift: int, height: int, width: int, *, invert: bool = False) -> Tensor:
+    """Cyclic shift of a `(batch, height, width, channels)` map."""
+    if shift == 0:
+        return x
+    x = _roll(x, shift, 1, height, invert=invert)
+    return _roll(x, shift, 2, width, invert=invert)
+
+
+class BatchNorm2d(Module):
+    """Eval-mode BatchNorm over the channel axis of an NCHW tensor."""
+
+    def __init__(self, channels: int, eps: float = 1e-5) -> None:
+        self.eps = eps
+        self.channels = channels
+        self.weight = Tensor.ones([channels], dtype=DType.float32)
+        self.bias = Tensor.zeros([channels], dtype=DType.float32)
+        self.running_mean = Tensor.zeros([channels], dtype=DType.float32)
+        self.running_var = Tensor.ones([channels], dtype=DType.float32)
+
+    def forward(self, x: Tensor) -> Tensor:
+        scale = self.weight * F.rsqrt(self.running_var + self.eps)
+        shift = self.bias - self.running_mean * scale
+        scale = scale.reshape([1, self.channels, 1, 1])
+        shift = shift.reshape([1, self.channels, 1, 1])
+        return x * scale + shift
+
+
+class ClapAudioPatchEmbed(Module):
+    """4x4 convolution and LayerNorm. The input is already a square image."""
+
+    def __init__(self, config: AudioConfig) -> None:
+        self.spec_size = config.spec_size
+        self.proj = Conv2d(
+            config.patch_size,
+            1,
+            config.patch_embeds_hidden_size,
+            dtype=DType.float32,
+            stride=config.patch_stride,
+            padding=0,
+            has_bias=True,
+            permute=True,
+        )
+        self.norm = LayerNorm(config.patch_embeds_hidden_size, eps=_DEFAULT_NORM_EPS)
+
+    def forward(self, hidden: Tensor) -> Tensor:
+        batch = hidden.shape[0]
+        hidden = self.proj(hidden)
+        channels = self.norm.dim
+        grid = self.spec_size // self.proj.stride[0]
+        hidden = hidden.reshape([batch, channels, grid * grid])
+        return self.norm(hidden.permute([0, 2, 1]))
+
+
+class ClapAudioSelfAttention(Module):
+    """Window attention with a learned relative-position bias."""
+
+    def __init__(self, dim: int, num_heads: int, window: int, *, bias: bool) -> None:
+        if dim % num_heads:
+            raise ValueError(f"{dim} is not divisible by {num_heads} heads")
+        self.heads = num_heads
+        self.head_dim = dim // num_heads
+        self.window = window
+        self.scale = self.head_dim ** -0.5
+        buckets = (2 * window - 1) ** 2
+        self.relative_position_bias_table = Tensor.zeros([buckets, num_heads], dtype=DType.float32)
+        self.relative_position_index = Tensor(relative_position_index(window))
+        self.query = Linear(dim, dim, bias=bias)
+        self.key = Linear(dim, dim, bias=bias)
+        self.value = Linear(dim, dim, bias=bias)
+
+    def forward(self, hidden: Tensor, batch, nwin: int, mask: Tensor | None) -> Tensor:
+        tokens = self.window * self.window
+        leading = hidden.shape[0]
+        query = self._heads(self.query(hidden), leading, tokens)
+        key = self._heads(self.key(hidden), leading, tokens)
+        value = self._heads(self.value(hidden), leading, tokens)
+        scores = (query @ key.permute([0, 1, 3, 2])) * self.scale
+        scores = scores + self._bias(tokens)
+        if mask is not None:
+            scores = scores.reshape([batch, nwin, self.heads, tokens, tokens]) + mask
+            scores = scores.reshape([leading, self.heads, tokens, tokens])
+        context = F.softmax(scores, axis=-1) @ value
+        return context.permute([0, 2, 1, 3]).reshape([leading, tokens, self.heads * self.head_dim])
+
+    def _heads(self, states: Tensor, leading, tokens) -> Tensor:
+        return states.reshape([leading, tokens, self.heads, self.head_dim]).permute([0, 2, 1, 3])
+
+    def _bias(self, tokens: int) -> Tensor:
+        gathered = F.gather(
+            self.relative_position_bias_table,
+            self.relative_position_index.reshape([-1]),
+            axis=0,
+        )
+        bias = gathered.reshape([tokens, tokens, self.heads])
+        return bias.permute([2, 0, 1]).reshape([1, self.heads, tokens, tokens])
+
+
+class ClapAudioSelfOutput(Module):
+    def __init__(self, dim: int) -> None:
+        self.dense = Linear(dim, dim)
+
+    def forward(self, hidden: Tensor) -> Tensor:
+        return self.dense(hidden)
+
+
+class ClapAudioAttention(Module):
+    def __init__(self, dim: int, num_heads: int, window: int, *, bias: bool) -> None:
+        self.self = ClapAudioSelfAttention(dim, num_heads, window, bias=bias)
+        self.output = ClapAudioSelfOutput(dim)
+
+    def forward(self, hidden: Tensor, batch, nwin: int, mask: Tensor | None) -> Tensor:
+        return self.output(self.self(hidden, batch, nwin, mask))
+
+
+class ClapAudioIntermediate(Module):
+    def __init__(self, dim: int, mlp_ratio: float) -> None:
+        self.dense = Linear(dim, int(mlp_ratio * dim))
+
+    def forward(self, hidden: Tensor) -> Tensor:
+        return F.gelu(self.dense(hidden))
+
+
+class ClapAudioOutput(Module):
+    def __init__(self, dim: int, mlp_ratio: float) -> None:
+        self.dense = Linear(int(mlp_ratio * dim), dim)
+
+    def forward(self, hidden: Tensor) -> Tensor:
+        return self.dense(hidden)
+
+
+class ClapAudioLayer(Module):
+    """One Swin block. Odd blocks shift the windows unless the map is one window."""
+
+    def __init__(
+        self,
+        dim: int,
+        height: int,
+        width: int,
+        num_heads: int,
+        window: int,
+        shift: int,
+        mlp_ratio: float,
+        eps: float,
+        *,
+        bias: bool,
+    ) -> None:
+        if min(height, width) <= window:
+            shift = 0
+        if height % window or width % window:
+            raise ValueError(f"map {height}x{width} is not divisible by window {window}")
+        self.dim = dim
+        self.height = height
+        self.width = width
+        self.window = window
+        self.shift = shift
+        self.nwin = (height // window) * (width // window)
+        self._mask = shifted_window_mask(height, width, window, shift)
+        self.layernorm_before = LayerNorm(dim, eps=eps)
+        self.attention = ClapAudioAttention(dim, num_heads, window, bias=bias)
+        self.layernorm_after = LayerNorm(dim, eps=eps)
+        self.intermediate = ClapAudioIntermediate(dim, mlp_ratio)
+        self.output = ClapAudioOutput(dim, mlp_ratio)
+
+    def forward(self, hidden: Tensor) -> Tensor:
+        batch = hidden.shape[0]
+        shortcut = hidden
+        spatial = self.layernorm_before(hidden).reshape([batch, self.height, self.width, self.dim])
+        shifted = roll_hw(spatial, self.shift, self.height, self.width)
+        windows = self._partition(shifted, batch)
+        attended = self.attention(windows, batch, self.nwin, self._mask_tensor(hidden.device))
+        merged = self._reverse(attended, batch)
+        tokens = merged.reshape([batch, self.height * self.width, self.dim])
+        hidden = shortcut + tokens
+        return hidden + self.output(self.intermediate(self.layernorm_after(hidden)))
+
+    def _partition(self, hidden: Tensor, batch) -> Tensor:
+        window = self.window
+        windows_h = self.height // window
+        windows_w = self.width // window
+        hidden = hidden.reshape([batch, windows_h, window, windows_w, window, self.dim])
+        hidden = hidden.permute([0, 1, 3, 2, 4, 5])
+        return hidden.reshape([-1, window * window, self.dim])
+
+    def _reverse(self, windows: Tensor, batch) -> Tensor:
+        window = self.window
+        windows_h = self.height // window
+        windows_w = self.width // window
+        hidden = windows.reshape([batch, windows_h, windows_w, window, window, self.dim])
+        hidden = hidden.permute([0, 1, 3, 2, 4, 5])
+        hidden = hidden.reshape([batch, self.height, self.width, self.dim])
+        return roll_hw(hidden, self.shift, self.height, self.width, invert=True)
+
+    def _mask_tensor(self, device) -> Tensor | None:
+        if self._mask is None:
+            return None
+        mask = F.constant(self._mask, dtype=DType.float32, device=device)
+        tokens = self.window * self.window
+        return mask.reshape([1, self.nwin, 1, tokens, tokens])
+
+
+class ClapAudioPatchMerging(Module):
+    """Concat each 2x2 neighborhood and project it down to twice the channels."""
+
+    def __init__(self, dim: int) -> None:
+        self.dim = dim
+        self.norm = LayerNorm(4 * dim, eps=_DEFAULT_NORM_EPS)
+        self.reduction = Linear(4 * dim, 2 * dim, bias=False)
+
+    def forward(self, hidden: Tensor, height: int, width: int) -> Tensor:
+        batch = hidden.shape[0]
+        spatial = hidden.reshape([batch, height, width, self.dim])
+        parts = []
+        for col in (0, 1):
+            for row in (0, 1):
+                parts.append(
+                    F.slice_tensor(
+                        spatial,
+                        [slice(None), slice(row, None, 2), slice(col, None, 2), slice(None)],
+                    )
+                )
+        merged = F.concat(parts, axis=-1)
+        merged = merged.reshape([batch, (height // 2) * (width // 2), 4 * self.dim])
+        return self.reduction(self.norm(merged))
+
+
+class ClapAudioStage(Module):
+    def __init__(
+        self,
+        config: AudioConfig,
+        dim: int,
+        height: int,
+        width: int,
+        depth: int,
+        num_heads: int,
+        *,
+        downsample: bool,
+    ) -> None:
+        self.height = height
+        self.width = width
+        self.blocks = ModuleList(
+            [
+                ClapAudioLayer(
+                    dim,
+                    height,
+                    width,
+                    num_heads,
+                    config.window_size,
+                    0 if index % 2 == 0 else config.window_size // 2,
+                    config.mlp_ratio,
+                    config.layer_norm_eps,
+                    bias=config.qkv_bias,
+                )
+                for index in range(depth)
+            ]
+        )
+        if downsample:
+            self.downsample = ClapAudioPatchMerging(dim)
+
+    def forward(self, hidden: Tensor) -> Tensor:
+        for block in self.blocks:
+            hidden = block(hidden)
+        if hasattr(self, "downsample"):
+            hidden = self.downsample(hidden, self.height, self.width)
+        return hidden
+
+
+class ClapAudioEncoder(Module):
+    """Log-mel `(batch, 1, frames, bins)` in, pooled features out."""
+
+    def __init__(self, config: AudioConfig) -> None:
+        if config.spec_size % config.num_mel_bins:
+            raise ValueError("spec_size must be a multiple of num_mel_bins")
+        if config.hidden_size != config.num_features:
+            raise ValueError(
+                f"hidden_size {config.hidden_size} must equal the pooled width {config.num_features}"
+            )
+        if config.mel_frames > config.spec_width:
+            raise ValueError("mel_frames is longer than the stretched spectrogram")
+        self.config = config
+        self.mel_frames = config.mel_frames
+        self.mel_bins = config.num_mel_bins
+        self.spec_size = config.spec_size
+        self.spec_width = config.spec_width
+        self.freq_ratio = config.freq_ratio
+        self.num_features = config.num_features
+        self.depths = config.depths
+        self.patch_stride = config.patch_stride
+        self._resize = None if config.mel_frames == config.spec_width else bicubic_map(
+            config.mel_frames, config.spec_width
+        )
+        self.batch_norm = BatchNorm2d(config.num_mel_bins)
+        self.patch_embed = ClapAudioPatchEmbed(config)
+        grid = config.spec_size // config.patch_stride
+        stages = []
+        for index, (depth, heads) in enumerate(zip(config.depths, config.num_attention_heads, strict=True)):
+            dim = config.patch_embeds_hidden_size * 2 ** index
+            stages.append(
+                ClapAudioStage(
+                    config,
+                    dim,
+                    grid,
+                    grid,
+                    depth,
+                    heads,
+                    downsample=index < len(config.depths) - 1,
+                )
+            )
+            if index < len(config.depths) - 1:
+                grid //= 2
+        self.layers = ModuleList(stages)
+        self.norm = LayerNorm(config.num_features, eps=_DEFAULT_NORM_EPS)
+
+    def forward(self, input_features: Tensor) -> Tensor:
+        normalized = self._normalize(input_features)
+        stretched = self._stretch(normalized)
+        hidden = self.patch_embed(self._fold(stretched))
+        for stage in self.layers:
+            hidden = stage(hidden)
+        return self._pool(self.norm(hidden))
+
+    def _normalize(self, features: Tensor) -> Tensor:
+        # (batch, 1, time, bins) -> channels are the mel bins.
+        ordered = features.permute([0, 3, 2, 1])
+        return self.batch_norm(ordered).permute([0, 3, 2, 1])
+
+    def _stretch(self, features: Tensor) -> Tensor:
+        if self._resize is None:
+            return features
+        batch = features.shape[0]
+        weight = F.constant(self._resize, dtype=DType.float32, device=features.device)
+        flat = features.reshape([batch, self.mel_frames, self.mel_bins]).permute([0, 2, 1])
+        stretched = flat @ weight.transpose(0, 1)
+        return stretched.permute([0, 2, 1]).reshape([batch, 1, self.spec_width, self.mel_bins])
+
+    def _fold(self, features: Tensor) -> Tensor:
+        """Fold the wide spectrogram into a `spec_size` square, as `reshape_mel2img` does."""
+        batch = features.shape[0]
+        ratio = self.freq_ratio
+        folded = features.reshape([batch, ratio, self.spec_size, self.mel_bins])
+        folded = folded.permute([0, 1, 3, 2])
+        return folded.reshape([batch, 1, self.spec_size, self.spec_size])
+
+    def _pool(self, hidden: Tensor) -> Tensor:
+        # The regroup in the reference reorders tokens and then averages them.
+        # The mean is taken in that order so the reduction matches.
+        batch = hidden.shape[0]
+        levels = len(self.depths) - 1
+        freq = self.spec_size // (2 ** levels) // self.patch_stride
+        temporal = self.spec_size // (2 ** levels) // self.patch_stride
+        channels = self.num_features
+        spatial = hidden.permute([0, 2, 1]).reshape([batch, channels, freq, temporal])
+        group = freq // self.freq_ratio
+        spatial = spatial.reshape([batch, channels, freq // group, group, temporal])
+        spatial = spatial.permute([0, 1, 3, 2, 4])
+        count = group * (freq // group) * temporal
+        flat = spatial.reshape([batch, channels, count])
+        # sum keeps the reduced axis, so reshape back to (batch, channels).
+        return F.sum(flat, axis=-1).reshape([batch, channels]) * (1.0 / count)

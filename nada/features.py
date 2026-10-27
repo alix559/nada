@@ -1,0 +1,145 @@
+"""Log-mel frontend for the unfused CLAP checkpoint.
+
+This follows the Hugging Face `ClapFeatureExtractor` path used when fusion
+is off: a periodic Hann window, a power spectrogram, Slaney mel filters
+from 50 Hz to 14 kHz, and a decibel scale. Clips shorter than 10 seconds
+are repeated and then zero-padded. Clips longer than 10 seconds are cropped.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+
+from .config import AudioConfig
+from .core import repo_root
+
+
+def log_mel(waveform: np.ndarray, config: AudioConfig | None = None, *, crop: str = "start") -> np.ndarray:
+    """Return one clip as `(1, 1, frames, mel_bins)` float32.
+
+    `crop` is `"start"` or `"random"`. The Hugging Face extractor draws a
+    random crop for clips longer than 10 seconds; `"start"` keeps tests still.
+    """
+    config = config or AudioConfig()
+    wave = _fit_length(np.asarray(waveform, dtype=np.float64).reshape(-1), config, crop)
+    mel = _power_mel(wave, config).T.astype(np.float32)
+    return mel[None, None, :, :]
+
+
+def log_mel_batch(
+    waveforms: list[np.ndarray],
+    config: AudioConfig | None = None,
+    *,
+    crop: str = "start",
+) -> np.ndarray:
+    """Stack `log_mel` over a batch. Every clip has the same frame count."""
+    return np.concatenate([log_mel(wave, config, crop=crop) for wave in waveforms], axis=0)
+
+
+def _fit_length(waveform: np.ndarray, config: AudioConfig, crop: str) -> np.ndarray:
+    length = config.max_samples
+    if waveform.size > length:
+        if crop == "start":
+            return waveform[:length]
+        if crop == "random":
+            start = np.random.randint(0, waveform.size - length + 1)
+            return waveform[start : start + length]
+        raise ValueError("crop must be 'start' or 'random'")
+    if waveform.size < length and waveform.size > 0:
+        repeats = int(length / waveform.size)
+        waveform = np.tile(waveform, repeats)
+    if waveform.size < length:
+        waveform = np.pad(waveform, (0, length - waveform.size))
+    return waveform
+
+
+def _hann(length: int) -> np.ndarray:
+    # Periodic Hann: the symmetric window of length+1, with the last sample dropped.
+    return np.hanning(length + 1)[:-1].astype(np.float64)
+
+
+def _power_mel(waveform: np.ndarray, config: AudioConfig) -> np.ndarray:
+    """Mel spectrogram as `(mel_bins, frames)`, matching `audio_utils.spectrogram`."""
+    frame = config.n_fft
+    hop = config.hop_length
+    padded = np.pad(waveform, (frame // 2, frame // 2), mode="reflect")
+    frames = 1 + (padded.size - frame) // hop
+    window = _hann(frame)
+    spec = np.empty((frames, frame // 2 + 1), dtype=np.float64)
+    for index in range(frames):
+        start = index * hop
+        spec[index] = np.abs(np.fft.rfft(padded[start : start + frame] * window)) ** 2
+    filters = _slaney_filters(config)
+    mel = np.maximum(1e-10, filters.T @ spec.T)
+    return (10.0 * np.log10(np.maximum(mel, 1e-10))).astype(np.float32)
+
+
+def _slaney_filters(config: AudioConfig) -> np.ndarray:
+    """`(frequency_bins, mel_bins)` Slaney filter bank."""
+    bins = config.n_fft // 2 + 1
+    mels = config.num_mel_bins
+    mel_min = _hertz_to_mel(config.frequency_min)
+    mel_max = _hertz_to_mel(config.frequency_max)
+    centers = _mel_to_hertz(np.linspace(mel_min, mel_max, mels + 2))
+    fft_freqs = np.linspace(0, config.sample_rate // 2, bins)
+    weights = _triangles(fft_freqs, centers)
+    widths = centers[2 : mels + 2] - centers[:mels]
+    return weights * (2.0 / widths)
+
+
+def _hertz_to_mel(freq: float | np.ndarray) -> float | np.ndarray:
+    min_log_hertz = 1000.0
+    min_log_mel = 15.0
+    logstep = 27.0 / np.log(6.4)
+    mels = 3.0 * np.asarray(freq, dtype=np.float64) / 200.0
+    if isinstance(freq, np.ndarray):
+        region = freq >= min_log_hertz
+        mels = mels.copy()
+        mels[region] = min_log_mel + np.log(freq[region] / min_log_hertz) * logstep
+        return mels
+    if freq >= min_log_hertz:
+        return min_log_mel + np.log(freq / min_log_hertz) * logstep
+    return float(mels)
+
+
+def _mel_to_hertz(mels: np.ndarray) -> np.ndarray:
+    min_log_hertz = 1000.0
+    min_log_mel = 15.0
+    logstep = np.log(6.4) / 27.0
+    freq = 200.0 * mels / 3.0
+    region = mels >= min_log_mel
+    freq = freq.copy()
+    freq[region] = min_log_hertz * np.exp(logstep * (mels[region] - min_log_mel))
+    return freq
+
+
+def _triangles(fft_freqs: np.ndarray, centers: np.ndarray) -> np.ndarray:
+    difference = np.diff(centers)
+    slopes = centers[None, :] - fft_freqs[:, None]
+    down = -slopes[:, :-2] / difference[:-1]
+    up = slopes[:, 2:] / difference[1:]
+    return np.maximum(0.0, np.minimum(down, up))
+
+
+def tokenize(texts: list[str] | str, *, max_length: int = 64, tokenizer: Path | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """RoBERTa token ids and a float mask, both padded to `max_length`.
+
+    The tokenizer file is `models/clap-htsat-unfused/tokenizer.json`, written
+    by `python -m nada.download`.
+    """
+    from tokenizers import Tokenizer
+
+    if isinstance(texts, str):
+        texts = [texts]
+    path = tokenizer or (repo_root() / "models" / "clap-htsat-unfused" / "tokenizer.json")
+    if not path.is_file():
+        raise FileNotFoundError(f"missing {path}. Run: pixi run -e reference convert")
+    encoder = Tokenizer.from_file(str(path))
+    encoder.enable_truncation(max_length=max_length)
+    encoder.enable_padding(length=max_length, pad_id=1, pad_token="<pad>")
+    encoded = encoder.encode_batch(list(texts))
+    ids = np.asarray([item.ids for item in encoded], dtype=np.int64)
+    mask = np.asarray([item.attention_mask for item in encoded], dtype=np.float32)
+    return ids, mask

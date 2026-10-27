@@ -1,0 +1,40 @@
+# nada
+
+LAION [CLAP](https://github.com/LAION-AI/CLAP) on [Modular MAX](https://docs.modular.com/max/). This is the unfused model: an HTSAT-tiny audio tower and a RoBERTa text tower, projected into one embedding. The weights are the Hugging Face release `laion/clap-htsat-unfused`, which is the `630k-audioset-best` checkpoint. Feature fusion, the four-crop path for long audio, is not in this graph.
+
+The layout follows `solid_lens`. `config` is the architecture, `weights` binds a checkpoint, and `compile_model` traces the module for one text length and the 10-second mel shape. The graph is a MAX module (`max.experimental.nn`): the same `forward` runs eagerly or compiled.
+
+## Install
+
+```sh
+pixi install
+pixi run -e reference convert
+```
+
+`convert` downloads the checkpoint and writes `models/clap.safetensors` plus the RoBERTa tokenizer. It needs PyTorch, which lives in the `reference` environment.
+
+## Embed
+
+```python
+from nada.features import log_mel_batch, tokenize
+from nada.model import build, compile_model, load_checkpoint
+from max.experimental.tensor import Tensor
+
+model = build()
+load_checkpoint(model)
+ids, mask = tokenize(["a dog barking", "rain on a window"])
+compiled = compile_model(model, text_batch=2, text_length=ids.shape[1], audio_batch=1)
+```
+
+`compiled` takes token ids, a mask, and a log-mel of shape `(audio_batch, 1, 1001, 64)`. It returns normalized text embeddings, normalized audio embeddings, and the two logit matrices. Cosine similarity is the dot product of the normalized embeddings. The logit scales from the checkpoint multiply those dots.
+
+`log_mel_batch` builds the mel the unfused feature extractor expects: 48 kHz, a 1024-point Hann window, hop 480, Slaney filters from 50 Hz to 14 kHz. Clips under 10 seconds are repeated and then padded. Longer clips are cropped from the start (`crop="random"` matches the Hugging Face extractor's random crop).
+
+## Check
+
+```sh
+pixi run smoke
+pixi run -e reference parity
+```
+
+`smoke` compiles a two-block model and checks that the embeddings are finite and unit length. `parity` compares that same model, weight for weight, with Hugging Face.

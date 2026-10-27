@@ -1,0 +1,164 @@
+"""Joint CLAP embedding.
+
+`build` constructs the unfused model on CPU. `compile_model` traces it for
+one text length and the audio config's mel shape, the same way solid_lens
+compiles a network for one image size. The result is four tensors: normalized
+text embeddings, normalized audio embeddings, and the two logit matrices.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from max.driver import CPU
+from max.dtype import DType
+from max.experimental import functional as F
+from max.experimental.nn import Module
+from max.experimental.tensor import Tensor, default_device
+from max.graph import TensorType
+
+from .audio import ClapAudioEncoder
+from .config import AudioConfig, ClapConfig, unfused_config
+from .core import repo_root
+from .text import ClapProjection, ClapTextModel, l2_normalize
+from .weights import assign_parameters, load_arrays
+
+
+class ClapModel(Module):
+    """HTSAT audio tower, RoBERTa text tower, and the two projection heads.
+
+    The forward pass matches `ClapModel` with fusion disabled. Logit scales
+    are applied after both embeddings are L2-normalized.
+    """
+
+    def __init__(self, config: ClapConfig | None = None) -> None:
+        self.config = config or unfused_config()
+        with default_device(CPU()):
+            scale = np.array([math.log(self.config.logit_scale_init_value)], dtype=np.float32)
+            # Length 1, not a scalar: the loader turns a 0-d checkpoint value into shape (1,).
+            self.logit_scale_a = Tensor(scale)
+            self.logit_scale_t = Tensor(scale)
+            self.text_model = ClapTextModel(self.config.text)
+            self.text_projection = ClapProjection(
+                self.config.text.hidden_size, self.config.text.projection_dim
+            )
+            self.audio_model = _AudioWrapper(self.config.audio)
+            self.audio_projection = ClapProjection(
+                self.config.audio.hidden_size, self.config.audio.projection_dim
+            )
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        attention_mask: Tensor,
+        input_features: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        text = self.text_embeds(input_ids, attention_mask)
+        audio = self.audio_embeds(input_features)
+        logits_per_text = (text @ audio.transpose(0, 1)) * _scalar(self.logit_scale_t)
+        logits_per_audio = (audio @ text.transpose(0, 1)) * _scalar(self.logit_scale_a)
+        return text, audio, logits_per_text, logits_per_audio
+
+    def text_embeds(self, input_ids: Tensor, attention_mask: Tensor) -> Tensor:
+        pooled = self.text_model(input_ids, attention_mask)
+        return l2_normalize(self.text_projection(pooled))
+
+    def audio_embeds(self, input_features: Tensor) -> Tensor:
+        pooled = self.audio_model(input_features)
+        return l2_normalize(self.audio_projection(pooled))
+
+
+class _AudioWrapper(Module):
+    """Owns the encoder under the name `audio_encoder`, matching the checkpoint."""
+
+    def __init__(self, config: AudioConfig) -> None:
+        self.audio_encoder = ClapAudioEncoder(config)
+
+    def forward(self, input_features: Tensor) -> Tensor:
+        return self.audio_encoder(input_features)
+
+
+def _scalar(value: Tensor) -> Tensor:
+    """Exponentiate a length-1 logit scale and broadcast it over a matrix."""
+    return F.reshape(F.exp(value), [1, 1])
+
+
+def build(config: ClapConfig | None = None) -> ClapModel:
+    """Construct the model on CPU."""
+    return ClapModel(config)
+
+
+def compile_model(
+    model: ClapModel,
+    *,
+    text_batch: int,
+    text_length: int,
+    audio_batch: int | None = None,
+):
+    """Compile the joint forward pass for these batch sizes and text length.
+
+    Audio frames and mel bins come from the model config. Recompile when the
+    text length changes; the RoBERTa table still covers up to 512 real tokens.
+    """
+    if audio_batch is None:
+        audio_batch = text_batch
+    audio = model.config.audio
+    device = model.device
+    return model.compile(
+        TensorType(DType.int64, [text_batch, text_length], device=device),
+        TensorType(DType.float32, [text_batch, text_length], device=device),
+        TensorType(DType.float32, [audio_batch, 1, audio.mel_frames, audio.num_mel_bins], device=device),
+    )
+
+
+def load_checkpoint(model: ClapModel, path=None) -> None:
+    """Load `models/clap.safetensors`, or `path` when given."""
+    checkpoint = path or (repo_root() / "models" / "clap.safetensors")
+    assign_parameters(model, load_arrays(checkpoint))
+
+
+def contrastive_loss(logits_per_text: np.ndarray, logits_per_audio: np.ndarray) -> float:
+    """Average of the two directions of the symmetric contrastive loss.
+
+    Labels are the diagonal. `logits_per_audio` is transposed so each column
+    of the text-audio matrix is a class distribution, matching the reference.
+    """
+    text = _row_cross_entropy(logits_per_text)
+    audio = _row_cross_entropy(np.asarray(logits_per_audio).T)
+    return float((text + audio) / 2.0)
+
+
+def _row_cross_entropy(logits: np.ndarray) -> float:
+    shifted = logits - logits.max(axis=-1, keepdims=True)
+    log_probs = shifted - np.log(np.exp(shifted).sum(axis=-1, keepdims=True))
+    index = np.arange(logits.shape[0])
+    return float(-log_probs[index, index].mean())
+
+
+def _main() -> None:
+    import sys
+
+    from .features import log_mel_batch, tokenize
+
+    phrases = sys.argv[1:] or ["a dog barking", "a person speaking"]
+    model = build()
+    load_checkpoint(model)
+    ids, mask = tokenize(phrases)
+    compiled = compile_model(model, text_batch=len(phrases), text_length=ids.shape[1], audio_batch=1)
+    silence = np.zeros(model.config.audio.max_samples, dtype=np.float32)
+    features = log_mel_batch([silence], model.config.audio)
+    text, audio, logits_text, _ = compiled(
+        Tensor(ids),
+        Tensor(mask),
+        Tensor(features),
+    )
+    scores = np.asarray(logits_text.to_numpy()).reshape(len(phrases), -1)
+    print("text", np.asarray(text.to_numpy()).shape)
+    print("audio", np.asarray(audio.to_numpy()).shape)
+    for phrase, row in zip(phrases, scores, strict=True):
+        print(f"{row[0]: .4f}  {phrase}")
+
+
+if __name__ == "__main__":
+    _main()

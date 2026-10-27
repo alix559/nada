@@ -1,0 +1,52 @@
+"""Compile the tiny CLAP graph and check that a forward pass returns finite embeddings."""
+
+from __future__ import annotations
+
+import numpy as np
+from max.experimental.tensor import Tensor
+
+from .config import tiny_config
+from .model import build, compile_model
+
+
+def main() -> None:
+    config = tiny_config()
+    model = build(config)
+    text_batch, text_length = 2, 6
+    audio_batch = 2
+    compiled = compile_model(
+        model,
+        text_batch=text_batch,
+        text_length=text_length,
+        audio_batch=audio_batch,
+    )
+    ids = np.arange(text_batch * text_length, dtype=np.int64).reshape(text_batch, text_length) % config.text.vocab_size
+    ids[:, -1] = config.text.pad_token_id
+    mask = np.ones((text_batch, text_length), dtype=np.float32)
+    mask[:, -1] = 0
+    features = np.random.default_rng(0).standard_normal(
+        (audio_batch, 1, config.audio.mel_frames, config.audio.num_mel_bins)
+    ).astype(np.float32)
+    text, audio, logits_text, logits_audio = compiled(Tensor(ids), Tensor(mask), Tensor(features))
+    text_np = np.asarray(text.to_numpy())
+    audio_np = np.asarray(audio.to_numpy())
+    if text_np.shape != (text_batch, config.text.projection_dim):
+        raise SystemExit(f"text shape {text_np.shape}")
+    if audio_np.shape != (audio_batch, config.audio.projection_dim):
+        raise SystemExit(f"audio shape {audio_np.shape}")
+    if not np.isfinite(text_np).all() or not np.isfinite(audio_np).all():
+        raise SystemExit("embeddings are not finite")
+    norms = np.linalg.norm(text_np, axis=-1)
+    if not np.allclose(norms, 1.0, atol=1e-4):
+        raise SystemExit(f"text embeddings are not unit length: {norms}")
+    print(
+        "smoke ok",
+        "text", tuple(text_np.shape),
+        "audio", tuple(audio_np.shape),
+        "logits", tuple(np.asarray(logits_text.to_numpy()).shape),
+        tuple(np.asarray(logits_audio.to_numpy()).shape),
+    )
+
+
+if __name__ == "__main__":
+    main()
