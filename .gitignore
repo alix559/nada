@@ -10,3 +10,8 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .ipynb_checkpoints/
+
+# nbdev / quarto build output
+_docs/
+_proc/
+.quarto/

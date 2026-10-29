@@ -17,6 +17,7 @@ numpy = ">=1.26"
 tokenizers = ">=0.20"
 huggingface_hub = ">=0.26"
 safetensors = ">=0.4"
+jupyter = ">=1.1.1,<2"
 
 [pypi-dependencies]
 nada = { path = ".", editable = true }

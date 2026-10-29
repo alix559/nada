@@ -1,0 +1,14 @@
+project:
+  output-dir: _docs
+
+website:
+  title: "nada"
+  site-url: "https://alix559.github.io/nada"
+  description: "LAION CLAP, the unfused HTSAT and RoBERTa model, on Modular MAX"
+  repo-branch: main
+  repo-url: "https://github.com/alix559/nada"
+
+format-links:
+  - html
+  - format: commonmark
+    text: Markdown

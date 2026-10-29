@@ -1,0 +1,14 @@
+website:
+  sidebar:
+    contents:
+      - index.ipynb
+      - 00_core.ipynb
+      - 01_config.ipynb
+      - 02_weights.ipynb
+      - 03_text.ipynb
+      - 04_audio.ipynb
+      - 05_features.ipynb
+      - 06_model.ipynb
+      - 07_download.ipynb
+      - 08_smoke.ipynb
+      - 09_parity.ipynb

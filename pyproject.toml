@@ -22,8 +22,20 @@ dependencies = [
     "tokenizers>=0.20",
 ]
 
+[project.urls]
+Repository = "https://github.com/alix559/nada"
+Documentation = "https://alix559.github.io/nada/"
+
+[project.entry-points.nbdev]
+nada = "nada._modidx:d"
+
 [tool.setuptools.dynamic]
 version = {attr = "nada.__version__"}
 
 [tool.setuptools.packages.find]
 include = ["nada"]
+
+[tool.nbdev]
+lib_path = "nada"
+nbs_path = "nbs"
+doc_path = "_docs"
