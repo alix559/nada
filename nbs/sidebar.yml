@@ -5,7 +5,7 @@ website:
       - 00_core.ipynb
       - 01_config.ipynb
       - 02_weights.ipynb
-      - 03_text.ipynb
+      - 03_layers.ipynb
       - 04_audio.ipynb
       - 05_features.ipynb
       - 06_model.ipynb

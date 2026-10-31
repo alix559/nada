@@ -1,3 +1,3 @@
-# Unfused LAION CLAP checkpoint used by nada.download.
-# laion/clap-htsat-unfused is the Hugging Face release of 630k-audioset-best.pt.
-laion/clap-htsat-unfused
+# Checkpoint used by nada.download.
+# facebook/wav2vec2-base-960h is wav2vec 2.0 base fine-tuned on 960 hours of LibriSpeech.
+facebook/wav2vec2-base-960h

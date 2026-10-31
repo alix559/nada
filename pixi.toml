@@ -2,11 +2,13 @@
 authors = ["Alex <alixjcob559@gmail.com>"]
 channels = ["https://conda.modular.com/max/", "conda-forge"]
 name = "nada"
-platforms = ["linux-64"]
+platforms = ["linux-64", "osx-arm64"]
 version = "0.1.0"
 
 [tasks]
-smoke = { cmd = "python -m nada.smoke", description = "Compile a tiny CLAP graph and check that it runs" }
+smoke = { cmd = "python -m nada.smoke", description = "Compile a tiny wav2vec 2.0 graph and check that it runs" }
+convert = { cmd = "python -m nada.download", description = "Download facebook/wav2vec2-base-960h and write a safetensors checkpoint" }
+transcribe = { cmd = "python -m nada.model", description = "Transcribe 16 kHz WAV files: pixi run transcribe clip.wav" }
 nbdev-export = { cmd = "nbdev-export", description = "Export notebooks into the nada package" }
 
 [dependencies]
@@ -14,7 +16,6 @@ mojo = ">=1.1.0,<2"
 max = ">=26.6.0,<27"
 nbdev = ">=3.3.26,<4"
 numpy = ">=1.26"
-tokenizers = ">=0.20"
 huggingface_hub = ">=0.26"
 safetensors = ">=0.4"
 jupyter = ">=1.1.1,<2"
@@ -27,8 +28,7 @@ pytorch = ">=2.5"
 transformers = ">=4.46"
 
 [feature.reference.tasks]
-parity = { cmd = "python -m nada.parity", description = "Compare CLAP against the Hugging Face implementation" }
-convert = { cmd = "python -m nada.download", description = "Download laion/clap-htsat-unfused and write a safetensors checkpoint" }
+parity = { cmd = "python -m nada.parity", description = "Compare wav2vec 2.0 against the Hugging Face implementation" }
 
 [environments]
 default = { solve-group = "default" }

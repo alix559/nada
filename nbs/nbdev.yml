@@ -4,7 +4,7 @@ project:
 website:
   title: "nada"
   site-url: "https://alix559.github.io/nada"
-  description: "LAION CLAP, the unfused HTSAT and RoBERTa model, on Modular MAX"
+  description: "Wav2vec 2.0 speech recognition on Modular MAX"
   repo-branch: main
   repo-url: "https://github.com/alix559/nada"
 

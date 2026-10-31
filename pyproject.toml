@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "nada"
 dynamic = ["version"]
-description = "LAION CLAP, the unfused HTSAT and RoBERTa model, on Modular MAX"
+description = "Wav2vec 2.0 speech recognition on Modular MAX"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 authors = [{name = "Alex", email = "alixjcob559@gmail.com"}]
-keywords = ["clap", "audio", "max"]
+keywords = ["wav2vec2", "speech", "asr", "max"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
@@ -19,7 +19,6 @@ dependencies = [
     "numpy>=1.26",
     "safetensors>=0.4",
     "huggingface_hub>=0.26",
-    "tokenizers>=0.20",
 ]
 
 [project.urls]
