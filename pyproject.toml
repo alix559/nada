@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "nada"
 dynamic = ["version"]
-description = "Wav2vec 2.0 speech recognition on Modular MAX"
+description = "Audio-JEPA audio embeddings on Modular MAX"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 authors = [{name = "Alex", email = "alixjcob559@gmail.com"}]
-keywords = ["wav2vec2", "speech", "asr", "max"]
+keywords = ["audio-jepa", "audio", "embeddings", "max"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",

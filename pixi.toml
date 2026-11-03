@@ -6,9 +6,9 @@ platforms = ["linux-64", "osx-arm64"]
 version = "0.1.0"
 
 [tasks]
-smoke = { cmd = "python -m nada.smoke", description = "Compile a tiny wav2vec 2.0 graph and check that it runs" }
-convert = { cmd = "python -m nada.download", description = "Download facebook/wav2vec2-base-960h and write a safetensors checkpoint" }
-transcribe = { cmd = "python -m nada.model", description = "Transcribe 16 kHz WAV files: pixi run transcribe clip.wav" }
+smoke = { cmd = "python -m nada.smoke", description = "Compile a tiny Audio-JEPA graph and check that it runs" }
+embed = { cmd = "python -m nada.model", description = "Embed WAV files: pixi run embed clip.wav" }
+center = { cmd = "python -c \"from nada.model import build, compile_model, load_checkpoint, make_center; m = build(); load_checkpoint(m); make_center(m, compile_model(m, batch=1))\"", description = "Write models/embed_center.npy from synthetic clips" }
 nbdev-export = { cmd = "nbdev-export", description = "Export notebooks into the nada package" }
 
 [dependencies]
@@ -25,10 +25,11 @@ nada = { path = ".", editable = true }
 
 [feature.reference.dependencies]
 pytorch = ">=2.5"
-transformers = ">=4.46"
+torchaudio = ">=2.5"
 
 [feature.reference.tasks]
-parity = { cmd = "python -m nada.parity", description = "Compare wav2vec 2.0 against the Hugging Face implementation" }
+convert = { cmd = "python -m nada.download", description = "Download ltuncay/Audio-JEPA and write a safetensors checkpoint (needs PyTorch to read the .ckpt)" }
+parity = { cmd = "python -m nada.parity", description = "Compare the MAX graph and the log-mel frontend with PyTorch and torchaudio" }
 
 [environments]
 default = { solve-group = "default" }

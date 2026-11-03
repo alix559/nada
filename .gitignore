@@ -2,6 +2,9 @@
 models/*
 !models/.gitkeep
 
+# Upstream clone used while porting
+.cache/
+
 # pixi environments
 .pixi/*
 !.pixi/config.toml
